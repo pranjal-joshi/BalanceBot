@@ -5,10 +5,14 @@
 #include "I2Cdev.h"
 #include "MPU6050_6Axis_MotionApps20.h"
 #include "Wire.h"
+#include <PID_v1.h>
+#include "HMC5883L.h"
 
 // Pin configuation..............................
 #define BT_BAUD 9600
 #define BUILTIN_LED 13
+#define MPU_VCC_PIN A0
+#define SONAR_VCC_PIN A1
 
 // SONAR
 #define TRIG_PIN 11
@@ -25,14 +29,27 @@
 
 // MPU6050
 #define INTR_PIN 2
+#define MPU_SKIP_INTR 20
+
+// PID constants
+#define kp 7
+#define ki 1
+#define kd 0.05
+#define PID_SAMPLE_TIME 5   //ms
+#define ANGLE_OFFSET 0.3
+#define ORIG_SETPOINT 0
 //...........................................................
 
-bool SERIAL_PRINT = true;
+bool SERIAL_DEBUG = true;
+double input,output;
+double setpoint = 0;
 
 SoftwareSerial bt(4,3);   // Rx,Tx
 BlynkTimer timer;
 NewPing sonar(TRIG_PIN, ECHO_PIN, MAX_DIST);
 MPU6050 mpu;
+HMC5883L compass;
+PID pid(&input,&output,&setpoint,kp,ki,kd,DIRECT);
 
 // Blynk token from email.
 char auth[] = "bcb21e631c55432b998b24a9e387a540";
@@ -40,6 +57,7 @@ unsigned int sonarReading;
 
 bool dmpReady = false;
 volatile bool mpuIntr = false;
+volatile byte mpuIntrCnt = 0;
 uint8_t mpuIntStatus;
 uint8_t devStatus;
 uint16_t packetSize, fifoCount;
@@ -48,22 +66,32 @@ float ypr[3];
 Quaternion q;
 VectorFloat gravity;
 
+int16_t mx,my,mz;
+
 void(*resetFunction)(void) = 0;
 
 void setup()
 {
-   if(SERIAL_PRINT)
+   if(SERIAL_DEBUG)
   {
-    Serial.begin(9600);
-    Serial.println("Starting balance bot sketch...");
+    Serial.begin(38400);
+    Serial.println(F("Starting balance bot sketch..."));
   }
-  
+
+  pinMode(MPU_VCC_PIN,OUTPUT);
+  digitalWrite(MPU_VCC_PIN,HIGH);
+  pinMode(SONAR_VCC_PIN,OUTPUT);
+  digitalWrite(SONAR_VCC_PIN,HIGH);
   bootBlink();
   bt.begin(BT_BAUD);
   initMotors();
   initMpu();
+  initCompass();
+  initPID();
   Blynk.begin(bt,auth);
-   timer.setInterval(1000L,readSonar);
+   timer.setInterval(667L, readSonar);
+   timer.setInterval(500L, sendPitch);
+   timer.setInterval(1333L, readCompass);
 }
 
 void loop()
@@ -74,8 +102,12 @@ void loop()
   }
   while(!mpuIntr && fifoCount < packetSize)   // Non-MPU things here..
   {
+    /*
     Blynk.run();
     timer.run();
+    balance();
+    */
+    // do nothing here...
   }
   mpuIntr = false;
   mpuIntStatus = mpu.getIntStatus();
@@ -83,6 +115,8 @@ void loop()
   if((mpuIntStatus & 0x10) || fifoCount == 1024)
   {
     mpu.resetFIFO();
+    if(SERIAL_DEBUG)
+      Serial.println(F("Resetting FIFO.."));
   }
   else if(mpuIntStatus & 0x02)
   {
@@ -95,11 +129,17 @@ void loop()
     mpu.dmpGetQuaternion(&q,fifoBuffer);
     mpu.dmpGetGravity(&gravity,&q);
     mpu.dmpGetYawPitchRoll(ypr,&q,&gravity);
-    for(byte k=0;k<3;k++)
-    {
-      ypr[k] = ypr[k] * 180/M_PI;
-    }
+    ypr[1] = ypr[1] * 180/M_PI;
+    input = ypr[1];
     
+    if(SERIAL_DEBUG)
+    {
+      //Serial.print("Pitch: ");
+      //Serial.println(ypr[1]);
+    }
+    Blynk.run();
+    timer.run();
+    balance();
   }
   
 }
@@ -115,7 +155,7 @@ BLYNK_WRITE(V0)         // read joystick data over bluetooth
 {
   unsigned int x = param[0].asInt();
   unsigned int y = param[1].asInt();
-  if(SERIAL_PRINT)
+  if(SERIAL_DEBUG)
   {
     Serial.print("X:\t");
     Serial.print(x,DEC);
@@ -126,21 +166,25 @@ BLYNK_WRITE(V0)         // read joystick data over bluetooth
   {
     set_speed(abs((y-128)*2));
     fwd();
+    setpoint = ORIG_SETPOINT - ANGLE_OFFSET;
   }
   else if((y < 128) && (y < x))
   {
     set_speed(abs((y-128)*2));
     rev();
+    setpoint = ORIG_SETPOINT + ANGLE_OFFSET;
   }
   else if((x < 128) && (x < y))
   {
     set_speed(abs((x-128)*2));
      left();
+     setpoint = ORIG_SETPOINT;
   }
    else
    {
      set_speed(abs((x-128)*2));
      right();
+     setpoint = ORIG_SETPOINT;
    }
 }
 
@@ -149,19 +193,35 @@ BLYNK_WRITE(V3)       // Reset arduino through app
   unsigned int val = param.asInt();
   if(val == 1)
   {
-    if(SERIAL_PRINT)
+    if(SERIAL_DEBUG)
     {
-      Serial.println("Resetting in 3 seconds...");
+      Serial.println(F("Resetting in 3 seconds..."));
     }
     resetBlink();
     resetFunction();
   }
 }
 
-unsigned int readSonar()
+// Sensors to Blynk PUSH
+void readSonar()
 {
    sonarReading = sonar.ping_cm();
   Blynk.virtualWrite(V1,sonarReading);
+}
+
+void sendPitch()
+{
+  Blynk.virtualWrite(V2,ypr[1]);
+}
+
+void readCompass()
+{
+  compass.getHeading(&mx,&my,&mz);
+  float head = atan2(my,mx);
+  if(head < 0)
+    head += 2 * M_PI;
+  head = head *180/M_PI;
+  Blynk.virtualWrite(V4, head);
 }
 
 
@@ -272,30 +332,37 @@ void set_speed(unsigned int val)
 
 void dmpDataReady()           // DMP ISR
 {
-  mpuIntr = true;
+  mpuIntrCnt++;
+  if(mpuIntrCnt > MPU_SKIP_INTR)
+  {
+    mpuIntrCnt = 0;
+    mpuIntr = true;
+  }
 }
 
 void initMpu()
 {
   Wire.begin();
-  Wire.setClock(400000);
+  Wire.setClock(400000);      // set I2C bus frequency.
   mpu.initialize();
   pinMode(INTR_PIN, INPUT);
-  if(SERIAL_PRINT)
+  if(SERIAL_DEBUG)
   {
      if(!mpu.testConnection())
      {
-        Serial.println("*** MPU6050 connection failure.");
+        Serial.println(F("*** MPU6050 connection failure."));
         while(1)
           errorBlink();
      }
+     else
+      Serial.println(F("*** MPU6050 connected."));
   }
   devStatus = mpu.dmpInitialize();
   
   mpu.setXGyroOffset(220);
   mpu.setYGyroOffset(76);
   mpu.setZGyroOffset(-85);
-  mpu.setZAccelOffset(1688);
+  mpu.setZAccelOffset(1788);
 
   if(devStatus == 0)
   {
@@ -304,13 +371,61 @@ void initMpu()
     mpuIntStatus = mpu.getIntStatus();
     dmpReady = true;
     packetSize = mpu.dmpGetFIFOPacketSize();
+    if(SERIAL_DEBUG)
+      Serial.println(F("*** DMP initialized."));
   }
   else
   {
-    if(SERIAL_PRINT)
-      Serial.println("MPU-DMP initialization failed.");
+    if(SERIAL_DEBUG)
+      Serial.println(F("MPU-DMP initialization failed."));
     while(1)
       errorBlink();
+  }
+}
+
+void initCompass()
+{
+  compass.initialize();
+  if(SERIAL_DEBUG)
+    Serial.println(compass.testConnection() ? "*** Compass connected." : "*** Compass failed.");
+}
+
+// PID & Control routines ---------------------
+
+void initPID()
+{
+  pid.SetMode(AUTOMATIC);
+  pid.SetOutputLimits(-127,127);
+  pid.SetSampleTime(PID_SAMPLE_TIME);
+}
+
+void balance()
+{
+  pid.Compute();
+  if(output < -0.01)
+  {
+    rev();
+    set_speed(abs(output*2));
+  }
+  else if(output > 0.01)
+  {
+    fwd();
+    set_speed(output*2);
+  }
+  else              // motor cut off if balanced.
+  {
+    analogWrite(en1,0);
+    analogWrite(en2,0);
+    setpoint = ORIG_SETPOINT;
+  }
+  if(SERIAL_DEBUG)
+  {
+    Serial.print(output*2);
+    Serial.print("\t");
+    String k;
+    output > 0? k="fwd\t" : k="rev\t";
+    Serial.print(k);
+    Serial.println(input);
   }
 }
 
